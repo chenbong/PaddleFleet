@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 import unittest
 from contextlib import ExitStack, contextmanager
 from io import StringIO
@@ -43,6 +44,7 @@ from paddlefleet.transformer.indexcache_state import (
     IndexCacheStateKind,
     apply_stop_gradient_mask,
     format_indexcache_gradient_summary,
+    is_valid_state,
     state_from_slots,
     state_kind,
     state_to_slots,
@@ -1500,6 +1502,207 @@ class TestIndexCacheCoreState(unittest.TestCase):
         )
         expected[:, 1, :] = 0.0
         self.assertTrue(paddle.allclose(topk_probs.grad, expected).item())
+
+
+class TestIndexCacheServedTargets(unittest.TestCase):
+    def test_received_state_preserves_loss_and_gradient_normalization(self):
+        # Isolate the selected-target kernel boundary. Exercise the real packed
+        # state, dtype conversion, KL reduction, and score-gradient PyLayer.
+        for cp_size, mask_values, coeff, fallback in (
+            (1, None, 0.6, False),
+            (2, None, 0.6, False),
+            (2, [1.0, 0.0], 0.6, False),
+            (2, [0.0, 0.0], 0.6, False),
+            (1, None, 0.0, False),
+            (1, None, 0.6, True),
+        ):
+            with self.subTest(
+                cp=cp_size, mask=mask_values, coeff=coeff, fallback=fallback
+            ):
+                config = _layer_config(
+                    "FS",
+                    indexcache_multi_layer_distill=True,
+                    pipeline_model_parallel_size=1 if fallback else 2,
+                    dsa_indexer_loss_coeff=coeff,
+                    num_hidden_layers=2,
+                )
+                producer = _make_layer(config, 1)
+                producer.training = False
+                indices = paddle.to_tensor([[[0, 1], [0, 1]]], dtype="int32")
+                probs = paddle.to_tensor([[[0.25, 0.75], [0.25, 0.75]]])
+                loss_state = (
+                    paddle.ones([1]),
+                    paddle.ones([1]),
+                    paddle.ones([1]),
+                    indices,
+                    probs,
+                )
+                state = producer._indexcache_cache_topk(
+                    indices,
+                    0,
+                    "FS",
+                    tilelang_indexer_loss_state=loss_state,
+                    served_count=2,
+                    loss_scale=coeff / 2.0,
+                )
+                state[5].stop_gradient = False
+                served = _make_layer(config, 2)
+                served.tp_group = None
+                served.softmax_scale = 1.0
+                served.cp_enabled = cp_size > 1
+                served.cp_size = cp_size
+                query = paddle.ones([1, 2, 1, 4])
+                query.stop_gradient = False
+                keys = paddle.ones([1, 2, 4])
+                keys.stop_gradient = False
+                target = paddle.to_tensor([[[0.75, 0.25], [0.75, 0.25]]])
+                mask = (
+                    None
+                    if mask_values is None
+                    else paddle.to_tensor([mask_values])
+                )
+                count = None if mask is None else 3.0
+
+                def selected_target(q, k, selected, scale):
+                    self.assertTrue(q.stop_gradient and k.stop_gradient)
+                    self.assertTrue(paddle.equal_all(selected, indices).item())
+                    self.assertEqual(selected.dtype, paddle.int32)
+                    self.assertEqual(scale, 1.0)
+                    return target
+
+                with (
+                    patch(
+                        "paddlefleet.tilelang_ops.csa_attn_target_reducesum",
+                        side_effect=selected_target,
+                    ) as kernel,
+                    patch.object(
+                        DSAIndexerLossLoggingHelper, "save_loss_to_tracker"
+                    ) as tracker,
+                    patch.object(
+                        DSAIndexerLossAutoScaler,
+                        "_main_loss_backward_scale",
+                        1.0,
+                    ),
+                ):
+                    result = served._indexcache_served_distill_state(
+                        query,
+                        keys,
+                        1,
+                        "FS",
+                        loss_mask=mask,
+                        global_valid_count=count,
+                        indexcache_state=None if fallback else state,
+                    )
+                    kernel.assert_called_once()
+                    scale = coeff / 2.0 / (cp_size if mask is None else 1)
+                    self.assertEqual(result[0].dtype, paddle.float32)
+                    self.assertIs(result[1], target)
+                    self.assertAlmostEqual(result[2], scale)
+                    self.assertEqual(result[3], count)
+                    self.assertIs(result[4], mask)
+                    self.assertEqual(result[5:7], (2, 1))
+                    if coeff:
+                        kl = 0.5 * math.log(3.0)
+                        expected_loss = scale * kl
+                        if mask_values is not None:
+                            expected_loss *= sum(mask_values) / count
+                        self.assertAlmostEqual(
+                            float(tracker.call_args.kwargs["loss"]),
+                            expected_loss,
+                            places=6,
+                        )
+                    else:
+                        tracker.assert_not_called()
+                    main_input = paddle.ones([1, 2, 1])
+                    main_input.stop_gradient = False
+                    output = main_input * 1.0
+                    IndexCacheServedDistillLossAutoScaler.apply(
+                        output, *result
+                    ).sum().backward()
+                    expected_grad = paddle.to_tensor(
+                        [[[-0.5, 0.5], [-0.5, 0.5]]]
+                    ) * (scale / (count or 2.0))
+                    if mask is not None:
+                        expected_grad = expected_grad * mask.unsqueeze(-1)
+                    self.assertTrue(
+                        paddle.allclose(
+                            state[5].grad.cast("float32"),
+                            expected_grad,
+                            rtol=0.01,
+                            atol=1e-5,
+                        ).item()
+                    )
+                    self.assertTrue(paddle.all(main_input.grad == 1).item())
+                    self.assertIsNone(query.grad)
+                    self.assertIsNone(keys.grad)
+
+    def test_missing_or_incompatible_producer_state_fails_before_kernel(self):
+        layer = _make_layer(
+            _layer_config(
+                "FS",
+                indexcache_multi_layer_distill=True,
+                pipeline_model_parallel_size=2,
+            ),
+            2,
+        )
+        query, keys = paddle.ones([1, 2, 1, 4]), paddle.ones([1, 2, 4])
+        with self.assertRaisesRegex(
+            RuntimeError, "before an explicit producer distill state"
+        ):
+            layer._indexcache_served_distill_state(query, keys, 1, "FS")
+        with self.assertRaisesRegex(
+            RuntimeError, "without producer loss tensors"
+        ):
+            layer._indexcache_served_distill_state(
+                query, keys, 1, "FS", indexcache_state=(query, keys, keys)
+            )
+        layer.training = False
+        self.assertIsNone(
+            layer._indexcache_served_distill_state(query, keys, 1, "FS")
+        )
+
+    def test_reuse_rejects_bad_layout_shape_and_configuration(self):
+        layer = _make_layer(_layer_config("FS"), 2)
+        with self.assertRaisesRegex(ValueError, "either topk-only"):
+            layer._indexcache_validate_state_for_reuse(
+                (paddle.ones([1]),), 1, "FS"
+            )
+        with self.assertRaisesRegex(
+            RuntimeError, "distill-state tensors require"
+        ):
+            layer._indexcache_validate_state_for_reuse(
+                tuple(paddle.ones([1]) for _ in range(8)), 1, "FS"
+            )
+        topk = paddle.zeros([1, 2, 4], dtype="int32")
+        state = (
+            topk,
+            paddle.to_tensor([1], dtype="int64"),
+            paddle.to_tensor([2], dtype="int64"),
+        )
+        with self.assertRaisesRegex(ValueError, "shape does not match"):
+            layer._indexcache_reuse_topk(2, 2, 1, "FS", state)
+        for pattern, message in (("FX", "only contain"), ("SF", "start with")):
+            layer.config.indexcache_topk_pattern = pattern
+            with self.assertRaisesRegex(ValueError, message):
+                layer._indexcache_next_c4_action()
+        layer.config.indexcache_topk_pattern = " "
+        self.assertIsNone(layer._indexcache_next_c4_action())
+        layer.config.indexcache_topk_pattern = "F"
+        with self.assertRaisesRegex(ValueError, "cover every C4 layer"):
+            layer._indexcache_next_c4_action()
+        layer.layer_number = 3
+        with self.assertRaisesRegex(RuntimeError, "could not find"):
+            layer._indexcache_next_c4_action()
+
+    def test_state_protocol_rejects_non_tensors(self):
+        with self.assertRaisesRegex(TypeError, "require paddle.Tensor"):
+            summarize_indexcache_gradients([("bad", 1)])
+        with self.assertRaisesRegex(
+            TypeError, "entries must be Paddle tensors"
+        ):
+            apply_stop_gradient_mask((paddle.ones([1]), None, paddle.ones([1])))
+        self.assertTrue(is_valid_state(None))
+        self.assertFalse(is_valid_state((None,)))
 
 
 if __name__ == "__main__":

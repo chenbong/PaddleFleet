@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import paddle
 
+import paddlefleet.transformer.transformer_layer as layer_module
 from paddlefleet.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
     TransformerLayer,
@@ -238,6 +239,102 @@ class TestIndexCacheTransformerLayerStateTransitions(unittest.TestCase):
         )
         self.assertEqual(len(retained), 3)
         self.assertIs(retained[2], old_state)
+
+
+class TestIndexCacheRecomputeTransport(unittest.TestCase):
+    def test_state_roundtrip_preserves_context_values_and_probability_gradient(
+        self,
+    ):
+        for size in (3, 8):
+            for with_context in (False, True):
+                with self.subTest(size=size, context=with_context):
+                    state = tuple(
+                        paddle.full([1], i + 1.0) for i in range(size)
+                    )
+                    output = paddle.ones([2, 4])
+                    context = paddle.ones([2, 1]) if with_context else None
+                    flat = layer_module._flatten_indexcache_recompute_outputs(
+                        (output, context, state)
+                    )
+                    restored = layer_module._unpack_flattened_indexcache_recompute_outputs(
+                        flat
+                    )
+                    self.assertIs(restored[0], output)
+                    self.assertIs(restored[1], context)
+                    self.assertEqual(len(restored[2]), size)
+                    for i, value in enumerate(restored[2]):
+                        self.assertTrue(
+                            paddle.equal_all(value, state[i]).item()
+                        )
+                        self.assertEqual(
+                            value.stop_gradient, not (size == 8 and i == 5)
+                        )
+                    if size == 8:
+                        restored[2][5].sum().backward()
+                        self.assertTrue(paddle.all(state[5].grad == 1).item())
+                    restored[2][0].set_value(paddle.zeros([1]))
+                    self.assertEqual(float(state[0].item()), 1.0)
+
+    def test_non_state_outputs_are_not_reinterpreted(self):
+        output = paddle.ones([1])
+        for value in (output, (output, None), (output, None, "metadata")):
+            self.assertIs(
+                layer_module._flatten_indexcache_recompute_outputs(value), value
+            )
+        for value in (output, (output,), (output, "a", "b", "c")):
+            self.assertIsNone(
+                layer_module._unpack_flattened_indexcache_recompute_outputs(
+                    value
+                )
+            )
+        self.assertIsNone(
+            layer_module._clone_indexcache_recompute_state_outputs(None)
+        )
+        self.assertEqual(
+            layer_module._mark_indexcache_recompute_state_stop_gradient(
+                "metadata"
+            ),
+            "metadata",
+        )
+
+    def test_leaf_conversion_preserves_values_and_gradients(self):
+        leaf = paddle.to_tensor([2.0, -3.0], stop_gradient=False)
+        converted = layer_module._ensure_recompute_non_leaf_tensor(leaf)
+        self.assertFalse(converted.is_leaf)
+        self.assertTrue(paddle.equal_all(converted, leaf).item())
+        self.assertIs(
+            layer_module._ensure_recompute_non_leaf_tensor(converted), converted
+        )
+        converted.square().sum().backward()
+        self.assertTrue(
+            paddle.allclose(leaf.grad, paddle.to_tensor([4.0, -6.0])).item()
+        )
+        detached = leaf.detach()
+        self.assertIs(
+            layer_module._ensure_recompute_non_leaf_tensor(detached), detached
+        )
+
+    def test_diagnostics_describe_optional_state_without_changing_it(self):
+        tensor = paddle.ones([2, 3])
+        value = (tensor, None, 7)
+        description = layer_module._describe_indexcache_recompute_input(value)
+        self.assertEqual(
+            description,
+            [
+                {
+                    "type": "Tensor",
+                    "shape": [2, 3],
+                    "dtype": str(tensor.dtype),
+                    "stop_gradient": True,
+                    "is_leaf": True,
+                },
+                {"type": "int"},
+            ],
+        )
+        self.assertIsNone(
+            layer_module._describe_indexcache_recompute_input(None)
+        )
+        self.assertTrue(tensor.stop_gradient)
 
 
 if __name__ == "__main__":

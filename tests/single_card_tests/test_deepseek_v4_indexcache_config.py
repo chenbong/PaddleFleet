@@ -65,3 +65,15 @@ class TestIndexCacheConfigMigration(unittest.TestCase):
         )
         self.assertEqual(config.indexcache_topk_pattern, "FF")
         self.assertEqual(unused, {"unrelated_option": 3})
+
+    def test_checkpoint_alias_normalization_and_invalid_types(self):
+        config = DeepseekV4Config.from_dict(
+            {"index_topk_pattern": " fs ", "indexcache_topk_pattern": "FS"}
+        )
+        self.assertEqual(config.indexcache_topk_pattern, "FS")
+        for value in (1, ["F", "S"], {"pattern": "FS"}):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "string or None"),
+            ):
+                DeepseekV4Config.from_dict({"index_topk_pattern": value})
